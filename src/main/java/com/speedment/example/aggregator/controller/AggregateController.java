@@ -22,7 +22,17 @@ import static java.util.stream.Collectors.joining;
 @RequestMapping("salaries")
 public class AggregateController {
 
+    /**
+     * The number of seconds in a day. 24 * 60 * 60 = 86400.
+     */
     private final static int SECONDS_IN_A_DAY = 86_400;
+
+    /**
+     * Custom deserializer that takes the epoch time of when the employee got
+     * the current salary - the date they were first hired and divides it with
+     * {@code SECONDS_IN_A_DAY} to get the number of days they have been
+     * employed.
+     */
     private final static DeserializeDouble<Salary> DAYS_EMPLOYED =
         multiply(
             minus(
@@ -43,31 +53,22 @@ public class AggregateController {
 
         // In the first pass, compute the mean salary and days of employment
         return Aggregator.builder(store, FirstPass::new)
-            .withEnumKey(Salary.GENDER)
+            .withEnumKey(Salary.GENDER) // How to buckets are defined
             .withCount(FirstPass::setCount)
             .withAverage(Salary.SALARY, FirstPass::setSalaryMean)
             .withAverage(DAYS_EMPLOYED, FirstPass::setDaysEmployedMean)
             .build()
             .aggregate(store.references())
 
-            // As a second pass, compute the variance of salary, days of employment and their covariance
+            // As a second pass, compute the variance of salary, days of
+            // employment and their covariance
             .flatMap(mean -> {
                 final Salary.Gender gender = store.deserializeReference(mean.ref, Salary.GENDER);
-                return Aggregator.builder(store, ref -> new SecondPass(ref, mean.salaryMean, mean.daysEmployedMean))
-                    .withEnumKey(Salary.GENDER)
-                    .withCount(SecondPass::setCount)
+                return Aggregator.builder(store, ref -> new SecondPass(ref, mean))
+                    .withEnumKey(Salary.GENDER) // Same as above
                     .withVariance(Salary.SALARY, mean.salaryMean, SecondPass::setSalaryVariance)
                     .withVariance(DAYS_EMPLOYED, mean.daysEmployedMean, SecondPass::setDaysEmployedVariance)
-                    .withAverage(multiply(
-                        minus(
-                            getAsDouble(Salary.SALARY),
-                            fixed(mean.salaryMean)
-                        ),
-                        minus(
-                            DAYS_EMPLOYED,
-                            fixed(mean.daysEmployedMean)
-                        )
-                    ), SecondPass::setCovariance)
+                    .withAverage(covariance(mean.salaryMean, mean.daysEmployedMean), SecondPass::setCovariance)
                     .build()
                     .aggregate(genders.equal(gender, Order.ASC, 0, Long.MAX_VALUE));
             })
@@ -77,8 +78,10 @@ public class AggregateController {
 
             // Collect the result as json.
             .map(result -> format(
-                    "\"%s\":{\"count\":%d,\"salaryMean\":%.2f,\"salaryVariance\":%.5f," +
-                    "\"daysEmployedMean\":%.2f,\"daysEmployedVariance\":%.5f,\"covariance\":%.5f,\"correlation\":%.5f}",
+                    "\"%s\":{\"count\":%d," +
+                    "\"salary\":{\"mean\":%.2f,\"variance\":%.5f}," +
+                    "\"daysEmployed\":{\"mean\":%.2f,\"variance\":%.5f}," +
+                    "\"covariance\":%.5f,\"correlation\":%.5f}",
                 formatGender(store.deserializeReference(result.ref, Salary.GENDER)),
                 result.count,
                 result.salaryMean,
@@ -88,6 +91,19 @@ public class AggregateController {
                 result.covariance,
                 result.correlation
             )).collect(joining(",", "{", "}"));
+    }
+
+    private DeserializeDouble<Salary> covariance(double salaryMean, double daysEmployedMean) {
+        return multiply(
+            minus(
+                getAsDouble(Salary.SALARY),
+                fixed(salaryMean)
+            ),
+            minus(
+                DAYS_EMPLOYED,
+                fixed(daysEmployedMean)
+            )
+        );
     }
 
     private FieldCache.OfEnum<Salary.Gender> genderFieldCache() {
@@ -144,10 +160,11 @@ public class AggregateController {
         private double covariance;
         private double correlation;
 
-        SecondPass(long ref, double salaryMean, double daysEmployedMean) {
-            this.ref = ref;
-            this.salaryMean = salaryMean;
-            this.daysEmployedMean = daysEmployedMean;
+        SecondPass(long ref, FirstPass first) {
+            this.ref              = ref;
+            this.count            = first.count;
+            this.salaryMean       = first.salaryMean;
+            this.daysEmployedMean = first.daysEmployedMean;
         }
 
         void setCount(long count) {
