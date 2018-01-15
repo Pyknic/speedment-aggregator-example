@@ -5,6 +5,7 @@ import com.speedment.enterprise.datastore.runtime.aggregator.Aggregator;
 import com.speedment.enterprise.datastore.runtime.entitystore.EntityStore;
 import com.speedment.enterprise.datastore.runtime.entitystore.Order;
 import com.speedment.enterprise.datastore.runtime.fieldcache.FieldCache;
+import com.speedment.enterprise.datastore.runtime.function.deserialize.DeserializeDouble;
 import com.speedment.example.aggregator.db.salaries.Salary;
 import com.speedment.example.aggregator.db.salaries.SalaryManager;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,6 +14,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import static com.speedment.enterprise.datastore.runtime.aggregator.Aggregators.*;
 import static java.lang.String.format;
 import static java.util.stream.Collectors.joining;
 
@@ -21,14 +23,17 @@ import static java.util.stream.Collectors.joining;
 public class AggregateController {
 
     private final static int SECONDS_IN_A_DAY = 86_400;
+    private final static DeserializeDouble<Salary> DAYS_EMPLOYED =
+        multiply(
+            minus(
+                getAsLongOrElse(Salary.FROM_DATE, 0),
+                getAsLongOrElse(Salary.HIRE_DATE, 0)
+            ).asDeserializeDouble(),
+            fixed(1d / SECONDS_IN_A_DAY)
+        );
 
     private @Autowired DataStoreComponent dataStore;
     private @Autowired SalaryManager salaries;
-
-    @GetMapping("count")
-    long count() {
-        return salaries.stream().count();
-    }
 
     @GetMapping(path="correlate", produces = MediaType.APPLICATION_JSON_VALUE)
     String correlate() {
@@ -36,44 +41,52 @@ public class AggregateController {
         final EntityStore<Salary> store = entityStore();
         final FieldCache.OfEnum<Salary.Gender> genders = genderFieldCache();
 
-        return Aggregator.builder(store, MeanResult::new)
+        // In the first pass, compute the mean salary and days of employment
+        return Aggregator.builder(store, FirstPass::new)
             .withEnumKey(Salary.GENDER)
-            .withCount(MeanResult::setCount)
-            .withAverage(Salary.SALARY, MeanResult::setMeanSalary)
-            .withAverage(store2 -> ref ->
-                    (store2.deserializeInt(ref, Salary.FROM_DATE) -
-                        store2.deserializeInt(ref, Salary.HIRE_DATE)) / SECONDS_IN_A_DAY,
-                MeanResult::setMeanDaysOfEmployment)
+            .withCount(FirstPass::setCount)
+            .withAverage(Salary.SALARY, FirstPass::setSalaryMean)
+            .withAverage(DAYS_EMPLOYED, FirstPass::setDaysEmployedMean)
             .build()
             .aggregate(store.references())
+
+            // As a second pass, compute the variance of salary, days of employment and their covariance
             .flatMap(mean -> {
                 final Salary.Gender gender = store.deserializeReference(mean.ref, Salary.GENDER);
-                return Aggregator.builder(store, VarianceResult::new)
+                return Aggregator.builder(store, ref -> new SecondPass(ref, mean.salaryMean, mean.daysEmployedMean))
                     .withEnumKey(Salary.GENDER)
-                    .withCount(VarianceResult::setCount)
-                    .withAverage(store2 -> ref ->
-                        store2.deserializeInt(ref, Salary.SALARY) - mean.meanSalary,
-                        VarianceResult::setVarianceSalary)
-                    .withAverage(store2 -> ref -> (
-                        store2.deserializeInt(ref, Salary.FROM_DATE) -
-                        store2.deserializeInt(ref, Salary.HIRE_DATE)) / SECONDS_IN_A_DAY -
-                        mean.meanDaysOfEmployment,
-                        VarianceResult::setVarianceDaysOfEmployment
-                    )
+                    .withCount(SecondPass::setCount)
+                    .withVariance(Salary.SALARY, mean.salaryMean, SecondPass::setSalaryVariance)
+                    .withVariance(DAYS_EMPLOYED, mean.daysEmployedMean, SecondPass::setDaysEmployedVariance)
+                    .withAverage(multiply(
+                        minus(
+                            getAsDouble(Salary.SALARY),
+                            fixed(mean.salaryMean)
+                        ),
+                        minus(
+                            DAYS_EMPLOYED,
+                            fixed(mean.daysEmployedMean)
+                        )
+                    ), SecondPass::setCovariance)
                     .build()
-                    .aggregate(genders.equal(gender, Order.ASC, 0, Long.MAX_VALUE))
-                    .map(res -> res.setMeanSalary(mean.meanSalary))
-                    .map(res -> res.setMeanDaysOfEmployment(mean.meanSalary));
+                    .aggregate(genders.equal(gender, Order.ASC, 0, Long.MAX_VALUE));
             })
+
+            // Compute the correlation coefficient from the covariance and variance
+            .map(SecondPass::computeCorrelation)
+
+            // Collect the result as json.
             .map(result -> format(
-                    "\"%s\":{\"count\":%d,\"salaryMean\":%.5f,\"salaryVariance\":%.5f," +
-                    "\"daysOfEmploymentMean\":%.5f,\"daysOfEmploymentVariance\":%.5f}",
+                    "\"%s\":{\"count\":%d,\"salaryMean\":%.2f,\"salaryVariance\":%.5f," +
+                    "\"daysEmployedMean\":%.2f,\"daysEmployedVariance\":%.5f,\"covariance\":%.5f,\"correlation\":%.5f}",
                 formatGender(store.deserializeReference(result.ref, Salary.GENDER)),
                 result.count,
-                result.meanSalary,
-                result.varianceSalary,
-                result.meanDaysOfEmployment,
-                result.varianceDaysOfEmployment
+                result.salaryMean,
+                result.salaryVariance,
+                result.daysEmployedMean,
+                result.daysEmployedVariance,
+                result.covariance,
+                result.correlation
             )).collect(joining(",", "{", "}"));
     }
 
@@ -97,13 +110,13 @@ public class AggregateController {
         throw new IllegalStateException();
     }
 
-    private final static class MeanResult {
+    private final static class FirstPass {
         final long ref;
         long count;
-        double meanSalary;
-        double meanDaysOfEmployment;
+        double salaryMean;
+        double daysEmployedMean;
 
-        MeanResult(long ref) {
+        FirstPass(long ref) {
             this.ref = ref;
         }
 
@@ -111,51 +124,58 @@ public class AggregateController {
             this.count = count;
         }
 
-        void setMeanSalary(double meanSalary) {
-            this.meanSalary = meanSalary;
+        void setSalaryMean(double salaryMean) {
+            this.salaryMean = salaryMean;
         }
 
-        void setMeanDaysOfEmployment(double meanDaysOfEmployment) {
-            this.meanDaysOfEmployment = meanDaysOfEmployment;
+        void setDaysEmployedMean(double meanDaysOfEmployment) {
+            this.daysEmployedMean = meanDaysOfEmployment;
         }
     }
 
-    private final static class VarianceResult {
+    private final static class SecondPass {
+
         private final long ref;
         private long count;
-        private double meanSalary;
-        private double meanDaysOfEmployment;
-        private double varianceSalary;
-        private double varianceDaysOfEmployment;
+        private double salaryMean;
+        private double daysEmployedMean;
+        private double salaryVariance;
+        private double daysEmployedVariance;
+        private double covariance;
+        private double correlation;
 
-        VarianceResult(long ref) {
+        SecondPass(long ref, double salaryMean, double daysEmployedMean) {
             this.ref = ref;
-        }
-
-        long getRef() {
-            return ref;
+            this.salaryMean = salaryMean;
+            this.daysEmployedMean = daysEmployedMean;
         }
 
         void setCount(long count) {
             this.count = count;
         }
 
-        VarianceResult setMeanSalary(double meanSalary) {
-            this.meanSalary = meanSalary;
+        void setSalaryVariance(double varianceSalary) {
+            this.salaryVariance = varianceSalary;
+        }
+
+        void setDaysEmployedVariance(double daysEmployedVariance) {
+            this.daysEmployedVariance = daysEmployedVariance;
+        }
+
+        void setCovariance(double covariance) {
+            this.covariance = covariance;
+        }
+
+        SecondPass computeCorrelation() {
+            if (salaryVariance == 0 || daysEmployedVariance == 0) {
+                this.correlation = Double.NaN;
+            } else {
+                this.correlation = covariance / (
+                    Math.sqrt(salaryVariance) *
+                    Math.sqrt(daysEmployedVariance)
+                );
+            }
             return this;
-        }
-
-        VarianceResult setMeanDaysOfEmployment(double meanDaysOfEmployment) {
-            this.meanDaysOfEmployment = meanDaysOfEmployment;
-            return this;
-        }
-
-        void setVarianceSalary(double varianceSalary) {
-            this.varianceSalary = varianceSalary;
-        }
-
-        void setVarianceDaysOfEmployment(double varianceDaysOfEmployment) {
-            this.varianceDaysOfEmployment = varianceDaysOfEmployment;
         }
     }
 }
