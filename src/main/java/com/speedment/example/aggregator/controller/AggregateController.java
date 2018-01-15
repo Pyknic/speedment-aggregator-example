@@ -62,13 +62,13 @@ public class AggregateController {
 
             // As a second pass, compute the variance of salary, days of
             // employment and their covariance
-            .flatMap(mean -> {
-                final Salary.Gender gender = store.deserializeReference(mean.ref, Salary.GENDER);
-                return Aggregator.builder(store, ref -> new SecondPass(ref, mean))
+            .flatMap(firstPass -> {
+                final Salary.Gender gender = store.deserializeReference(firstPass.ref, Salary.GENDER);
+                return Aggregator.builder(store, ref -> new SecondPass(ref, firstPass))
                     .withEnumKey(Salary.GENDER) // Same as above
-                    .withVariance(Salary.SALARY, mean.salaryMean, SecondPass::setSalaryVariance)
-                    .withVariance(DAYS_EMPLOYED, mean.daysEmployedMean, SecondPass::setDaysEmployedVariance)
-                    .withAverage(covariance(mean.salaryMean, mean.daysEmployedMean), SecondPass::setCovariance)
+                    .withVariance(Salary.SALARY, firstPass.salaryMean, SecondPass::setSalaryVariance)
+                    .withVariance(DAYS_EMPLOYED, firstPass.daysEmployedMean, SecondPass::setDaysEmployedVariance)
+                    .withAverage(covariance(firstPass.salaryMean, firstPass.daysEmployedMean), SecondPass::setCovariance)
                     .build()
                     .aggregate(genders.equal(gender, Order.ASC, 0, Long.MAX_VALUE));
             })
@@ -126,7 +126,7 @@ public class AggregateController {
         throw new IllegalStateException();
     }
 
-    private final static class FirstPass {
+    private static class FirstPass {
         final long ref;
         long count;
         double salaryMean;
@@ -149,19 +149,15 @@ public class AggregateController {
         }
     }
 
-    private final static class SecondPass {
+    private static class SecondPass extends FirstPass {
 
-        private final long ref;
-        private long count;
-        private double salaryMean;
-        private double daysEmployedMean;
         private double salaryVariance;
         private double daysEmployedVariance;
         private double covariance;
         private double correlation;
 
         SecondPass(long ref, FirstPass first) {
-            this.ref              = ref;
+            super(ref);
             this.count            = first.count;
             this.salaryMean       = first.salaryMean;
             this.daysEmployedMean = first.daysEmployedMean;
